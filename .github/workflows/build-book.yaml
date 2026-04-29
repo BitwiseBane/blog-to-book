@@ -14,6 +14,10 @@ on:
         description: 'Release tag (e.g. v1.0.0)'
         required: false
         default: ''
+      cover_url:
+        description: 'Cover image URL (optional, e.g. https://example.com/cover.png)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -41,17 +45,22 @@ jobs:
       - name: Parse links.txt and fetch metadata
         id: meta
         run: |
-          # Read first non-comment line for book title if not overridden
           TITLE_FROM_FILE=$(grep "^# title:" links.txt | head -1 | sed 's/^# title://' | xargs || echo "")
           AUTHOR_FROM_FILE=$(grep "^# author:" links.txt | head -1 | sed 's/^# author://' | xargs || echo "Gouranga Das Samrat")
-          
-          # Use workflow input or fallback to file metadata
+          COVER_FROM_FILE=$(grep "^# cover:" links.txt | head -1 | sed 's/^# cover://' | xargs || echo "")
+
           BOOK_TITLE="${{ github.event.inputs.book_title }}"
           if [ -z "$BOOK_TITLE" ]; then
             BOOK_TITLE="$TITLE_FROM_FILE"
           fi
           if [ -z "$BOOK_TITLE" ]; then
             BOOK_TITLE="Developer Ebook"
+          fi
+
+          # Cover priority: workflow input > links.txt > none
+          COVER_URL="${{ github.event.inputs.cover_url }}"
+          if [ -z "$COVER_URL" ]; then
+            COVER_URL="$COVER_FROM_FILE"
           fi
 
           AUTHOR="$AUTHOR_FROM_FILE"
@@ -62,27 +71,45 @@ jobs:
           echo "author=$AUTHOR" >> $GITHUB_OUTPUT
           echo "date=$DATE" >> $GITHUB_OUTPUT
           echo "safe_title=$SAFE_TITLE" >> $GITHUB_OUTPUT
+          echo "cover_url=$COVER_URL" >> $GITHUB_OUTPUT
           echo "📚 Building: $BOOK_TITLE by $AUTHOR"
+          echo "🖼️  Cover: ${COVER_URL:-none}"
+
+      - name: Download cover image
+        id: cover
+        run: |
+          COVER_URL="${{ steps.meta.outputs.cover_url }}"
+          if [ -n "$COVER_URL" ]; then
+            echo "⬇️  Downloading cover from: $COVER_URL"
+            curl -sL "$COVER_URL" -o cover-image.jpg
+            # Verify it's actually an image
+            if file cover-image.jpg | grep -qE 'image|bitmap'; then
+              echo "✅ Cover downloaded successfully"
+              echo "has_cover=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  URL did not return a valid image — skipping cover"
+              rm -f cover-image.jpg
+              echo "has_cover=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ℹ️  No cover URL provided — skipping cover"
+            echo "has_cover=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Scrape dev.to articles
         run: |
           mkdir -p chapters
           CHAPTER=1
 
-          # Skip comment lines and empty lines
           grep -v "^#" links.txt | grep -v "^$" | while read -r URL; do
             echo "⬇️  Fetching: $URL"
 
-            # Extract article slug for API call
             SLUG=$(echo "$URL" | sed 's|https://dev.to/||')
-
-            # Use dev.to API to get article content
             API_URL="https://dev.to/api/articles/$SLUG"
             RESPONSE=$(curl -s "$API_URL" \
               -H "Accept: application/json" \
               -H "User-Agent: ebook-builder/1.0")
 
-            # Check if API returned valid data
             TITLE=$(echo "$RESPONSE" | jq -r '.title // empty')
             BODY=$(echo "$RESPONSE" | jq -r '.body_markdown // empty')
 
@@ -95,7 +122,6 @@ jobs:
             PADDED=$(printf "%03d" $CHAPTER)
             OUTFILE="chapters/${PADDED}-chapter.md"
 
-            # Write chapter with title and source
             {
               echo "# $TITLE"
               echo ""
@@ -111,14 +137,31 @@ jobs:
 
             echo "✅ Chapter $CHAPTER: $TITLE"
             CHAPTER=$((CHAPTER + 1))
-            sleep 0.5  # be polite to the API
+            sleep 0.5
           done
 
           echo "📄 Total chapters: $(ls chapters/*.md 2>/dev/null | wc -l)"
 
       - name: Create metadata file
         run: |
-          cat > metadata.yaml << EOF
+          HAS_COVER="${{ steps.cover.outputs.has_cover }}"
+
+          if [ "$HAS_COVER" = "true" ]; then
+            cat > metadata.yaml << EOF
+          ---
+          title: "${{ steps.meta.outputs.book_title }}"
+          author: "${{ steps.meta.outputs.author }}"
+          date: "${{ steps.meta.outputs.date }}"
+          lang: en
+          cover-image: cover-image.jpg
+          description: |
+            A comprehensive ebook compiled from dev.to articles
+            by ${{ steps.meta.outputs.author }}.
+          rights: "© ${{ steps.meta.outputs.author }}"
+          ...
+          EOF
+          else
+            cat > metadata.yaml << EOF
           ---
           title: "${{ steps.meta.outputs.book_title }}"
           author: "${{ steps.meta.outputs.author }}"
@@ -130,11 +173,19 @@ jobs:
           rights: "© ${{ steps.meta.outputs.author }}"
           ...
           EOF
+          fi
 
       - name: Build PDF
         run: |
           export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
           SAFE="${{ steps.meta.outputs.safe_title }}"
+          HAS_COVER="${{ steps.cover.outputs.has_cover }}"
+
+          # Build cover page args if cover exists
+          COVER_ARGS=""
+          if [ "$HAS_COVER" = "true" ]; then
+            COVER_ARGS="-V cover-image=cover-image.jpg"
+          fi
 
           pandoc metadata.yaml chapters/*.md \
             -o "${SAFE}.pdf" \
@@ -149,6 +200,7 @@ jobs:
             -V linkcolor=blue \
             -V urlcolor=blue \
             --number-sections \
+            $COVER_ARGS \
             2>&1 || echo "⚠️ PDF build had warnings"
 
           if [ -f "${SAFE}.pdf" ]; then
@@ -162,6 +214,7 @@ jobs:
         run: |
           SAFE="${{ steps.meta.outputs.safe_title }}"
 
+          # EPUB natively supports cover-image via metadata.yaml
           pandoc metadata.yaml chapters/*.md \
             -o "${SAFE}.epub" \
             --toc \
