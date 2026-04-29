@@ -36,7 +36,7 @@ jobs:
           export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
           tlmgr install xetex fontspec geometry fancyhdr titlesec tcolorbox
           tlmgr install hyperref xcolor graphics booktabs caption
-          tlmgr install lm lm-math || true
+          tlmgr install setspace lm lm-math || true
 
       - name: Parse links.txt and fetch metadata
         id: meta
